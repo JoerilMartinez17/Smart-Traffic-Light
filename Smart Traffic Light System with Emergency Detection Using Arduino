@@ -1,0 +1,534 @@
+#include <NewPing.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// System Configuration
+#define NUM_DIRECTIONS 4
+#define NUM_LIGHT_STATES 3
+#define SENSOR_FILTER_SIZE 5
+#define MIC_PIN A0
+
+// traffic light direction
+enum Direction { NORTH = 0, SOUTH = 1, EAST = 2, WEST = 3 };
+
+// Light states
+enum LightState { RED, YELLOW, GREEN };
+
+// System states
+enum SystemState {
+  NORTH_GREEN, NORTH_YELLOW,
+  SOUTH_GREEN, SOUTH_YELLOW,
+  EAST_GREEN, EAST_YELLOW,
+  WEST_GREEN, WEST_YELLOW
+};
+
+// Traffic Light Pin Configuration
+const byte trafficPins[NUM_DIRECTIONS][NUM_LIGHT_STATES] = {
+  {22, 23, 24},  // North - Red, Yellow, Green
+  {25, 26, 27},  // South - Red, Yellow, Green
+  {28, 29, 30},  // East - Red, Yellow, Green
+  {31, 32, 33}   // West - Red, Yellow, Green
+};
+
+// RFID Configuration
+#define RST_PIN 49
+#define SS_PIN 53
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// Ultrasonic Sensor Configuration
+const byte triggerPins[NUM_DIRECTIONS] = {34, 36, 38, 40};
+const byte echoPins[NUM_DIRECTIONS] = {35, 37, 39, 41};
+const unsigned int maxDistance = 200;  // 20cm max
+const unsigned int detectionThreshold = 100; // 10cm threshold
+
+NewPing sensors[NUM_DIRECTIONS] = {
+  NewPing(triggerPins[NORTH], echoPins[NORTH], maxDistance),
+  NewPing(triggerPins[SOUTH], echoPins[SOUTH], maxDistance),
+  NewPing(triggerPins[EAST], echoPins[EAST], maxDistance),
+  NewPing(triggerPins[WEST], echoPins[WEST], maxDistance)
+};
+
+// Timing configuration
+unsigned long greenTime = 4000;
+unsigned long yellowTime = 2000;
+unsigned long allRedTime = 1000;
+unsigned long minGreenTime = 3000;
+unsigned long maxGreenTime = 8000;
+
+// Siren detection configuration
+const float LOW_FREQ = 300.0;
+const float HIGH_FREQ = 1800.0;
+const float MIN_STRENGTH = 30.0;
+const unsigned long ALERT_DURATION = 10000;
+
+// System variables
+SystemState currentState = NORTH_GREEN;
+unsigned long stateStartTime = 0;
+bool vehicleWaiting[NUM_DIRECTIONS] = {false};
+unsigned long lastSensorPrint = 0;
+const unsigned long sensorPrintInterval = 500;
+const unsigned long sensorPingInterval = 100;
+
+// Emergency mode variables
+bool emergencyMode = false;
+String emergencyType = "";
+unsigned long emergencyStart = 0;
+Direction emergencyDirection = SOUTH; // Changed default to SOUTH
+
+// Siren detection variables
+int detectionCount = 0;
+float NOISE_FLOOR = 0.0;
+float peakFreq = 0;
+float peakMag = 0;
+unsigned long lastDebugTime = 0;
+Direction sirenDirection = SOUTH; // Changed default to SOUTH
+
+// Distance filtering
+unsigned int distanceHistory[NUM_DIRECTIONS][SENSOR_FILTER_SIZE];
+byte historyIndex[NUM_DIRECTIONS] = {0};
+
+// Function prototypes
+void initializeSystem();
+void handleTrafficStates();
+void transitionTo(SystemState newState);
+void transitionToNextGreen();
+void setDirection(byte direction, LightState state);
+void allRed();
+void setLights(SystemState state);
+void handleRFID();
+void activateEmergency(Direction dir = SOUTH); // Changed default to SOUTH
+void handleEmergency();
+void calibrateNoiseFloor();
+void simpleFFT(float *freq, float *mag);
+void checkForSiren();
+void updateVehiclePresence();
+void addDistanceReading(byte dir, unsigned int distance);
+unsigned int getMedianDistance(byte dir);
+String directionToString(byte dir);
+String stateToString(SystemState state);
+SystemState getNextDirection();
+void adjustTiming();
+void printSystemStatus();
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial); // Wait for serial connection
+  
+  initializeSystem();
+  Serial.println(F("System Ready - Integrated Smart Traffic Light System"));
+  Serial.println(F("Features: Vehicle Detection, RFID Emergency, Siren Detection"));
+  Serial.println(F("Direction\tDistance(mm)\tStatus"));
+  Serial.println(F("----------------------------------"));
+}
+
+void loop() {
+  static unsigned long lastPingTime = 0;
+  unsigned long currentTime = millis();
+  
+  // Check for RFID emergency
+  if (!emergencyMode && mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    handleRFID();
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+  }
+  
+  // Check for siren emergency
+  if (!emergencyMode) {
+    checkForSiren();
+  }
+  
+  // Handle emergency mode if active
+  if (emergencyMode) {
+    handleEmergency();
+    return;
+  }
+  
+  // Regular sensor updates
+  if (currentTime - lastPingTime >= sensorPingInterval) {
+    updateVehiclePresence();
+    lastPingTime = currentTime;
+  }
+  
+  // Debug output
+  printSystemStatus();
+  
+  // Adaptive timing adjustment
+  adjustTiming();
+  
+  // State machine execution
+  handleTrafficStates();
+}
+
+void initializeSystem() {
+  // Initialize RFID reader
+  SPI.begin();
+  mfrc522.PCD_Init();
+  
+  // Initialize traffic light pins
+  for (byte dir = 0; dir < NUM_DIRECTIONS; dir++) {
+    for (byte color = 0; color < NUM_LIGHT_STATES; color++) {
+      pinMode(trafficPins[dir][color], OUTPUT);
+      digitalWrite(trafficPins[dir][color], LOW);
+    }
+  }
+  
+  // Initialize distance history
+  for (byte dir = 0; dir < NUM_DIRECTIONS; dir++) {
+    for (byte i = 0; i < SENSOR_FILTER_SIZE; i++) {
+      distanceHistory[dir][i] = maxDistance * 10;
+    }
+  }
+  
+  // Calibrate noise floor for siren detection
+  calibrateNoiseFloor();
+  
+  setLights(NORTH_GREEN);
+  stateStartTime = millis();
+}
+
+void handleRFID() {
+  Serial.print(F("RFID UID:"));
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(mfrc522.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  // Determine emergency direction from card UID
+  Direction detectedDir;
+  byte firstByte = mfrc522.uid.uidByte[0];
+  
+  if (firstByte == 0xB6) detectedDir = NORTH;
+  else if (firstByte == 0xA2) detectedDir = SOUTH;
+  else if (firstByte == 0xC1) detectedDir = EAST;
+  else if (firstByte == 0xD3) detectedDir = WEST;
+  else detectedDir = static_cast<Direction>(firstByte % NUM_DIRECTIONS);
+
+  emergencyType = "RFID";
+  activateEmergency(detectedDir);
+}
+
+void activateEmergency(Direction dir) {
+  emergencyMode = true;
+  emergencyStart = millis();
+  emergencyDirection = dir;
+  
+  allRed();
+  setDirection(dir, GREEN); // Set green for emergency direction
+  
+  Serial.print(F("EMERGENCY (")); 
+  Serial.print(emergencyType);
+  Serial.print(F("): "));
+  Serial.print(directionToString(dir));
+  Serial.println(F(" GREEN activated"));
+}
+
+void handleTrafficStates() {
+  unsigned long currentTime = millis();
+  unsigned long elapsed = currentTime - stateStartTime;
+  
+  switch(currentState) {
+    case NORTH_GREEN:
+      if (elapsed >= greenTime && !vehicleWaiting[NORTH]) {
+        transitionTo(NORTH_YELLOW);
+      }
+      break;
+      
+    case NORTH_YELLOW:
+      if (elapsed >= yellowTime) {
+        allRed();
+        delay(allRedTime);
+        transitionToNextGreen();
+      }
+      break;
+      
+    case SOUTH_GREEN:
+      if (elapsed >= greenTime && !vehicleWaiting[SOUTH]) {
+        transitionTo(SOUTH_YELLOW);
+      }
+      break;
+      
+    case SOUTH_YELLOW:
+      if (elapsed >= yellowTime) {
+        allRed();
+        delay(allRedTime);
+        transitionToNextGreen();
+      }
+      break;
+      
+    case EAST_GREEN:
+      if (elapsed >= greenTime && !vehicleWaiting[EAST]) {
+        transitionTo(EAST_YELLOW);
+      }
+      break;
+      
+    case EAST_YELLOW:
+      if (elapsed >= yellowTime) {
+        allRed();
+        delay(allRedTime);
+        transitionToNextGreen();
+      }
+      break;
+      
+    case WEST_GREEN:
+      if (elapsed >= greenTime && !vehicleWaiting[WEST]) {
+        transitionTo(WEST_YELLOW);
+      }
+      break;
+      
+    case WEST_YELLOW:
+      if (elapsed >= yellowTime) {
+        allRed();
+        delay(allRedTime);
+        transitionToNextGreen();
+      }
+      break;
+  }
+}
+
+void transitionTo(SystemState newState) {
+  setLights(newState);
+  stateStartTime = millis();
+  
+  Serial.print(F("Transition to: "));
+  Serial.println(stateToString(newState));
+}
+
+void transitionToNextGreen() {
+  SystemState nextState = getNextDirection();
+  setLights(nextState);
+  stateStartTime = millis();
+  
+  Serial.print(F("Next direction: "));
+  Serial.println(stateToString(nextState));
+}
+
+void setDirection(byte direction, LightState state) {
+  for (byte color = 0; color < NUM_LIGHT_STATES; color++) {
+    digitalWrite(trafficPins[direction][color], LOW);
+  }
+  digitalWrite(trafficPins[direction][state], HIGH);
+}
+
+void allRed() {
+  for (byte dir = 0; dir < NUM_DIRECTIONS; dir++) {
+    setDirection(dir, RED);
+  }
+}
+
+void setLights(SystemState state) {
+  allRed();
+  
+  switch(state) {
+    case NORTH_GREEN: setDirection(NORTH, GREEN); break;
+    case NORTH_YELLOW: setDirection(NORTH, YELLOW); break;
+    case SOUTH_GREEN: setDirection(SOUTH, GREEN); break;
+    case SOUTH_YELLOW: setDirection(SOUTH, YELLOW); break;
+    case EAST_GREEN: setDirection(EAST, GREEN); break;
+    case EAST_YELLOW: setDirection(EAST, YELLOW); break;
+    case WEST_GREEN: setDirection(WEST, GREEN); break;
+    case WEST_YELLOW: setDirection(WEST, YELLOW); break;
+  }
+  
+  currentState = state;
+}
+
+void handleEmergency() {
+  if (millis() - emergencyStart >= ALERT_DURATION) {
+    emergencyMode = false;
+    emergencyType = "";
+    detectionCount = 0;
+    Serial.println(F("Emergency ended"));
+    allRed();
+    stateStartTime = millis();
+    currentState = NORTH_GREEN;
+    setLights(NORTH_GREEN);
+  }
+}
+
+void calibrateNoiseFloor() {
+  Serial.println(F("[CALIBRATING] Stay silent for 3 seconds..."));
+  float maxNoise = 0;
+  
+  for (int i = 0; i < 30; i++) {
+    simpleFFT(&peakFreq, &peakMag);
+    maxNoise = max(maxNoise, peakMag);
+    delay(100);
+  }
+  
+  NOISE_FLOOR = maxNoise * 1.1;
+  Serial.print(F("[CALIBRATED] Noise floor: "));
+  Serial.println(NOISE_FLOOR);
+}
+
+void simpleFFT(float *freq, float *mag) {
+  const int SAMPLES = 64;
+  float maxVal = 0;
+  float maxFreq = 0;
+  
+  for (int i = 0; i < SAMPLES; i++) {
+    float sample = analogRead(MIC_PIN);
+    if (sample > maxVal) {
+      maxVal = sample;
+      maxFreq = i * (4000.0/SAMPLES);
+    }
+    delayMicroseconds(250);
+  }
+  
+  *freq = maxFreq;
+  *mag = maxVal;
+}
+
+void checkForSiren() {
+  simpleFFT(&peakFreq, &peakMag);
+  
+  float threshold = NOISE_FLOOR + MIN_STRENGTH;
+  bool isSiren = (peakFreq > LOW_FREQ) && 
+                 (peakFreq < HIGH_FREQ) && 
+                 (peakMag > threshold);
+  
+  if (isSiren) {
+    // Always set siren direction to SOUTH when detected
+    sirenDirection = EAST;
+    
+    detectionCount = min(detectionCount + 1, 5);
+    Serial.print(F("Siren detected ("));
+    Serial.print(detectionCount);
+    Serial.print(F("/5) Direction: "));
+    Serial.println(directionToString(sirenDirection));
+    
+    if (detectionCount >= 5 && !emergencyMode) {
+      emergencyType = "SIREN";
+      activateEmergency(EAST); // Always activate SOUTH for siren
+    }
+  } else if (detectionCount > 0) {
+    detectionCount = max(detectionCount - 1, 0);
+    Serial.print(F("Siren not detected ("));
+    Serial.print(detectionCount);
+    Serial.println(F("/5)"));
+  }
+}
+
+void updateVehiclePresence() {
+  for (byte dir = 0; dir < NUM_DIRECTIONS; dir++) {
+    unsigned int rawDistance = sensors[dir].ping_cm() * 10;
+    if (rawDistance == 0) rawDistance = maxDistance * 10;
+    
+    addDistanceReading(dir, rawDistance);
+    unsigned int filteredDistance = getMedianDistance(dir);
+    
+    vehicleWaiting[dir] = (filteredDistance > 0 && filteredDistance < detectionThreshold);
+  }
+}
+
+void addDistanceReading(byte dir, unsigned int distance) {
+  distanceHistory[dir][historyIndex[dir]] = distance;
+  historyIndex[dir] = (historyIndex[dir] + 1) % SENSOR_FILTER_SIZE;
+}
+
+unsigned int getMedianDistance(byte dir) {
+  unsigned int temp[SENSOR_FILTER_SIZE];
+  memcpy(temp, distanceHistory[dir], sizeof(temp));
+  
+  for (byte i = 0; i < SENSOR_FILTER_SIZE-1; i++) {
+    for (byte j = 0; j < SENSOR_FILTER_SIZE-i-1; j++) {
+      if (temp[j] > temp[j+1]) {
+        unsigned int swap = temp[j];
+        temp[j] = temp[j+1];
+        temp[j+1] = swap;
+      }
+    }
+  }
+  
+  return temp[SENSOR_FILTER_SIZE/2];
+}
+
+String directionToString(byte dir) {
+  switch(dir) {
+    case NORTH: return F("NORTH");
+    case SOUTH: return F("SOUTH");
+    case EAST:  return F("EAST");
+    case WEST:  return F("WEST");
+    default:    return F("UNKNOWN");
+  }
+}
+
+String stateToString(SystemState state) {
+  switch(state) {
+    case NORTH_GREEN: return F("NORTH_GREEN");
+    case NORTH_YELLOW: return F("NORTH_YELLOW");
+    case SOUTH_GREEN: return F("SOUTH_GREEN");
+    case SOUTH_YELLOW: return F("SOUTH_YELLOW");
+    case EAST_GREEN: return F("EAST_GREEN");
+    case EAST_YELLOW: return F("EAST_YELLOW");
+    case WEST_GREEN: return F("WEST_GREEN");
+    case WEST_YELLOW: return F("WEST_YELLOW");
+    default: return F("UNKNOWN");
+  }
+}
+
+SystemState getNextDirection() {
+  static byte lastDirection = WEST;
+  byte nextDirection = (lastDirection + 1) % NUM_DIRECTIONS;
+  
+  for (byte i = 0; i < NUM_DIRECTIONS; i++) {
+    byte checkDir = (nextDirection + i) % NUM_DIRECTIONS;
+    if (vehicleWaiting[checkDir]) {
+      lastDirection = checkDir;
+      return static_cast<SystemState>(checkDir * 2);
+    }
+  }
+  
+  lastDirection = nextDirection;
+  return static_cast<SystemState>(nextDirection * 2);
+}
+
+void adjustTiming() {
+  byte activeDirections = 0;
+  for (byte dir = 0; dir < NUM_DIRECTIONS; dir++) {
+    if (vehicleWaiting[dir]) activeDirections++;
+  }
+  
+  greenTime = constrain(maxGreenTime / max(activeDirections, 1), minGreenTime, maxGreenTime);
+}
+
+void printSystemStatus() {
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastSensorPrint >= sensorPrintInterval) {
+    lastSensorPrint = currentMillis;
+    for (byte dir = 0; dir < NUM_DIRECTIONS; dir++) {
+      unsigned int distance = getMedianDistance(dir);
+      Serial.print(directionToString(dir));
+      Serial.print(F("\t\t"));
+      
+      if (distance >= maxDistance * 10) {
+        Serial.print(F("NO ECHO"));
+      } else {
+        Serial.print(distance);
+        Serial.print(F("mm\t\t"));
+      }
+      
+      Serial.println(vehicleWaiting[dir] ? F("VEHICLE DETECTED") : F("no vehicle"));
+    }
+    Serial.println();
+  }
+  
+  if (currentMillis - lastDebugTime >= 1000) {
+    lastDebugTime = currentMillis;
+    Serial.print(F("State: "));
+    Serial.print(emergencyMode ? "EMERGENCY " : "NORMAL ");
+    if (emergencyMode) {
+      Serial.print(emergencyType);
+      Serial.print(" ");
+      Serial.print(directionToString(emergencyDirection));
+    } else {
+      Serial.print(stateToString(currentState));
+    }
+    Serial.print(F(" | Green time: "));
+    Serial.print(greenTime);
+    Serial.print(F("ms | Last freq: "));
+    Serial.print(peakFreq);
+    Serial.println(F("Hz"));
+  }
+}
